@@ -116,6 +116,56 @@ _RE_AGE_WEIGHT = re.compile(r"(\d+)歳\s*/\s*(\d+\.\d+)kg")
 _RE_F_L_ST = re.compile(r"F(\d+)\s+L(\d+)\s+(\d+\.\d+)")
 _RE_THREE_NUM = re.compile(r"(-|\d+(?:\.\d+)?)\s+(-|\d+(?:\.\d+)?)\s+(-|\d+(?:\.\d+)?)")
 
+# 節間成績: STは「.32」のような小数点始まり、「F.02」「L」などもある
+_RE_SETTLE_ST = re.compile(r"^[FL]?\.?(\d{2,3})$")  # .32, F.02, L, 等
+# 着順: 単一数字、または 1〜6（全角漢字もあり）
+_KANJI_NUM = {"１": 1, "２": 2, "３": 3, "４": 4, "５": 5, "６": 6,
+              "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
+
+
+def _parse_settle_row(cells_text: list, anchor_kanji: list = None) -> dict:
+    """
+    選手ブロックの末尾付近にある今節成績（コース・ST・着順の3行）から
+    節間ST平均・節間2連率を抽出する。
+
+    cells_text: tbody内のtdテキストを順番に並べたリスト
+    anchor_kanji: aタグ内に含まれる漢数字テキストのリスト（着順専用）
+    戻り値: {"settle_st": float or None, "settle_2rate": float or None}
+    """
+    # ST値候補（.NN 形式）を抽出
+    st_values = []
+    for t in cells_text:
+        t = t.strip()
+        if t.startswith("F") or t.startswith("L"):
+            continue
+        m = re.fullmatch(r"\.(\d{2,3})", t)
+        if m:
+            try:
+                v = float("0." + m.group(1))
+                if 0.0 <= v <= 0.40:
+                    st_values.append(v)
+            except ValueError:
+                pass
+
+    # 着順候補（aタグ内の漢数字 or 全角数字のみ）
+    finish_positions = []
+    if anchor_kanji:
+        for t in anchor_kanji:
+            t = t.strip()
+            if t in _KANJI_NUM:
+                finish_positions.append(_KANJI_NUM[t])
+
+    settle_st = None
+    if st_values:
+        settle_st = round(sum(st_values) / len(st_values), 3)
+
+    settle_2rate = None
+    if finish_positions:
+        in_2 = sum(1 for p in finish_positions if p <= 2)
+        settle_2rate = round(in_2 / len(finish_positions), 3)
+
+    return {"settle_st": settle_st, "settle_2rate": settle_2rate}
+
 
 def _num(s: str) -> Optional[float]:
     try:
@@ -178,6 +228,25 @@ def parse_racelist(html: str) -> Optional[List[Racer]]:
             m2 = _num(triples[2][1])
             motor_2rate = m2 / 100.0 if m2 is not None else None
 
+        # 節間成績抽出: tbody内の全td/aタグをテキスト化して解析
+        cells_text = []
+        for el in tbody.find_all(["td"]):
+            tx = el.get_text(strip=True)
+            if tx:
+                cells_text.append(tx)
+        # aタグ内の漢数字（着順リンク）のみを別途収集
+        anchor_kanji = []
+        for a in tbody.find_all("a"):
+            tx = a.get_text(strip=True)
+            # raceresult?rno=... へのリンクが着順リンク
+            href = a.get("href", "")
+            if "raceresult" in href and tx in _KANJI_NUM:
+                anchor_kanji.append(tx)
+            elif tx in _KANJI_NUM:
+                # href属性がない/他形式でも漢数字単独なら着順扱い
+                anchor_kanji.append(tx)
+        settle = _parse_settle_row(cells_text, anchor_kanji=anchor_kanji)
+
         racers.append(Racer(
             name=name,
             cls=cls_,
@@ -186,9 +255,8 @@ def parse_racelist(html: str) -> Optional[List[Racer]]:
             motor_2rate=motor_2rate,
             f_count=f_count,
             weight=weight,
-            # 節間系は別取得（今回は未実装→段階劣化でNone）
-            settle_st=None,
-            settle_2rate=None,
+            settle_st=settle["settle_st"],
+            settle_2rate=settle["settle_2rate"],
         ))
 
     return racers if len(racers) == 6 else None
