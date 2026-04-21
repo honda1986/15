@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-v16 1=5形フィルタ Streamlit UI (期間指定スクレイピング版)
+v16 1=5形フィルタ Streamlit UI (期間指定スクレイピング版・買い目固定)
 =======================================================
 boatrace.jp から出走表を取得し、指定期間の全開催場・全レースを走査して
 v16 1=5形の候補レースを抽出する。
@@ -80,16 +80,12 @@ def render_detail(sel: dict):
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    bets = sel.get("bets")
-    if bets and (bets["3連単_本線"] or bets["2連単"]):
-        st.subheader("🎯 推奨買い目")
-        if bets["3連単_本線"]:
-            st.markdown("**3連単 本線**: " + " / ".join(bets["3連単_本線"]))
-        if bets["3連単_押さえ"]:
-            st.markdown("**3連単 押さえ**: " + " / ".join(bets["3連単_押さえ"]))
-        if bets["2連単"]:
-            st.markdown("**2連単**: " + " / ".join(bets["2連単"]))
-        st.caption("※3連単 1-5-X のオッズ10倍未満の買い目はスキップ推奨")
+    # 買い目を 1-45-45, 1-56-56 に固定表示
+    if sel["candidate"]:
+        st.subheader("🎯 推奨買い目 (固定)")
+        st.markdown("**3連単**: 1-4-5 / 1-5-4 / 1-5-6 / 1-6-5")
+        st.markdown("*(フォーメーション: 1-45-45, 1-56-56)*")
+        st.caption("※オッズ10倍未満の買い目はスキップ推奨")
 
     # 結果と回収率（終了済みの場合）
     result = sel.get("result")
@@ -317,7 +313,7 @@ with tab1:
                     rr_pct = "-"
 
                 rows.append({
-                    "日付": c.get("date", ""), # ★テーブルに日付列を追加
+                    "日付": c.get("date", ""),
                     "場": c["venue"],
                     "R": c["r_no"],
                     "判定": c["judge"],
@@ -335,7 +331,6 @@ with tab1:
 
             st.markdown("---")
             st.subheader("🔍 詳細を見る")
-            # ドロップダウンにも日付を追加して識別しやすく
             options = [f"{c.get('date', '')} {c['venue']} {c['r_no']}R  {c['judge']} "
                        f"{c['scores']['TOTAL']:+.1f}" for c in cands]
             idx = st.selectbox(
