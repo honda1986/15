@@ -23,6 +23,7 @@ from v16_itigo_filter import (
 )
 from v16_fetcher import (
     fetch_day_candidates, date_to_str,
+    enrich_candidates_with_results, aggregate_recovery,
     JCD_TO_NAME, NAME_TO_JCD, COURSE1_WIN_RATE,
 )
 
@@ -88,6 +89,58 @@ def render_detail(sel: dict):
             st.markdown("**2連単**: " + " / ".join(bets["2連単"]))
         st.caption("※3連単 1-5-X のオッズ10倍未満の買い目はスキップ推奨")
 
+    # 結果と回収率（終了済みの場合）
+    result = sel.get("result")
+    recovery = sel.get("recovery")
+    if result:
+        st.markdown("---")
+        st.subheader("🏁 レース結果")
+        finish = result["finish_order"]
+
+        c1, c2, c3 = st.columns([1, 1, 1])
+        c1.markdown(f"**着順**: {'-'.join(str(n) for n in finish[:3])}")
+        if result.get("kimarite"):
+            c2.markdown(f"**決まり手**: {result['kimarite']}")
+        c3.markdown(f"**1=5形**: {'✅ 的中' if result['is_165_hit'] else '✕ 不発'}")
+
+        # 配当
+        d1, d2 = st.columns(2)
+        if result.get("trifecta_combo"):
+            d1.metric(
+                "3連単",
+                result["trifecta_combo"],
+                f"¥{result.get('trifecta_payout', 0):,}",
+            )
+        if result.get("exacta_combo"):
+            d2.metric(
+                "2連単",
+                result["exacta_combo"],
+                f"¥{result.get('exacta_payout', 0):,}",
+            )
+
+        # 回収率
+        if recovery:
+            st.markdown("### 💰 買い目収支（1点100円換算）")
+            rr = recovery["recovery_rate"]
+            profit = recovery["total_return"] - recovery["total_spent"]
+            r1, r2, r3 = st.columns(3)
+            r1.metric("投資額", f"¥{recovery['total_spent']:,}")
+            r2.metric("回収額", f"¥{recovery['total_return']:,}")
+            r3.metric(
+                "回収率",
+                f"{rr}%",
+                f"{profit:+,}円",
+                delta_color=("normal" if rr >= 100 else "inverse"),
+            )
+            if recovery["hits"]:
+                st.markdown("**的中買い目**:")
+                for combo, payout in recovery["hits"]:
+                    st.markdown(f"- `{combo}` → ¥{payout:,}")
+            else:
+                st.info("買い目不的中")
+    elif sel.get("date"):  # 対象日が指定されている = レース情報がある
+        st.info("🕓 このレースはまだ結果が出ていません")
+
     jcd = sel.get("jcd") or NAME_TO_JCD.get(sel["venue"], "")
     date_str = sel.get("date") or st.session_state.get("target_date_str", "")
     if jcd and date_str:
@@ -135,6 +188,11 @@ with tab1:
         value=False,
         help="取得時間が約2倍になります。直前情報発表前のレースには無効。",
     )
+    fetch_results = st.checkbox(
+        "レース結果・回収率も取得",
+        value=True,
+        help="終了済みレースの着順・払戻金・買い目との照合結果を表示します。",
+    )
 
     if st.button("🎯 取得して抽出", use_container_width=True, type="primary"):
         date_str = date_to_str(target_date)
@@ -150,6 +208,9 @@ with tab1:
                 use_beforeinfo=use_beforeinfo,
                 progress_cb=pb,
             )
+            # 結果取得（終了済みレースのみ）
+            if fetch_results and cands:
+                cands = enrich_candidates_with_results(cands, progress_cb=pb)
         prog.empty()
 
         st.session_state["candidates"] = cands
@@ -173,19 +234,63 @@ with tab1:
             cands = [c for c in cands if c.get("scores") is not None]
             st.success(f"✅ {len(cands)}件の候補を抽出しました")
 
+            # 全体集計（終了済みレースがある場合のみ）
+            agg = aggregate_recovery(cands)
+            if agg.get("n_finished", 0) > 0:
+                st.markdown("### 📊 全体成績")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric(
+                    "終了レース",
+                    f"{agg['n_finished']}/{agg['n_total']}",
+                    f"未終了 {agg['n_pending']}" if agg.get('n_pending') else None,
+                )
+                c2.metric(
+                    "1=5形的中",
+                    f"{agg['n_165_hit']}/{agg['n_finished']}",
+                    f"{agg['hit_165_rate']}%",
+                )
+                c3.metric(
+                    "何らか的中",
+                    f"{agg['n_any_hit']}/{agg['n_finished']}",
+                    f"{agg['hit_any_rate']}%",
+                )
+                rr = agg['recovery_rate']
+                c4.metric(
+                    "回収率",
+                    f"{rr}%",
+                    f"{'+' if rr >= 100 else ''}{int(agg['total_return'] - agg['total_spent']):+,}円",
+                    delta_color=("normal" if rr >= 100 else "inverse"),
+                )
+                st.caption(f"投資 ¥{agg['total_spent']:,} / 回収 ¥{agg['total_return']:,}（1点100円換算）")
+                st.markdown("---")
+
             rows = []
             for c in cands:
                 s = c["scores"]
+                result = c.get("result")
+                recovery = c.get("recovery")
+
+                # 結果表示
+                if result:
+                    finish = "-".join(str(n) for n in result["finish_order"][:3])
+                    hit_165 = "✅" if result["is_165_hit"] else "✕"
+                    rr_pct = f"{recovery['recovery_rate']}%" if recovery else "-"
+                else:
+                    finish = "未終了"
+                    hit_165 = "-"
+                    rr_pct = "-"
+
                 rows.append({
                     "場": c["venue"],
                     "R": c["r_no"],
                     "判定": c["judge"],
                     "TOTAL": f"{s['TOTAL']:+.2f}",
+                    "結果": finish,
+                    "1=5": hit_165,
+                    "回収率": rr_pct,
                     "P1": f"{s['P1']:+.1f}",
                     "P5": f"{s['P5']:+.1f}",
                     "R45": f"{s['R45']:+.1f}",
-                    "N23": f"{s['N23']:+.1f}",
-                    "W": f"{s['W']:+.1f}",
                     "1号艇": c["race"].b1.name,
                     "5号艇": c["race"].b5.name,
                 })
