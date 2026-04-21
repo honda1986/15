@@ -1,18 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-v16 fetcher: ボートレース公式 (boatrace.jp) スクレイパー
-=========================================================
-日付と場コードから出走表を取得し、v16_itigo_filter.Race オブジェクトを構築する。
-
-Requirements:
-    requests
-    beautifulsoup4
-
-使い方:
-    from v16_fetcher import fetch_day_candidates
-    candidates = fetch_day_candidates("20260420")  # その日の全場・全R走査
-    for c in candidates:
-        print(c["venue"], c["r_no"], c["scores"]["TOTAL"])
+v16 fetcher (uchisankaku版): uchisankaku.sakura.ne.jp スクレイパー
+================================================================
+1場1リクエストで12レース分全データを取得できる。
+節間成績・コース別6カ月ST・決まり手率まで揃うため、
+v16 1=5形フィルタに必要な全指標が埋まる。
 """
 
 import re
@@ -26,13 +18,10 @@ from bs4 import BeautifulSoup
 
 from v16_itigo_filter import (
     Racer, Weather, Race,
-    evaluate_race, score_165, is_165_candidate, judge_rank, generate_bets,
+    score_165, is_165_candidate, judge_rank, generate_bets,
 )
 
 
-# ============================================================
-# 場コード・場名マッピング
-# ============================================================
 JCD_TO_NAME = {
     "01": "桐生", "02": "戸田", "03": "江戸川", "04": "平和島",
     "05": "多摩川", "06": "浜名湖", "07": "蒲郡", "08": "常滑",
@@ -44,9 +33,11 @@ JCD_TO_NAME = {
 NAME_TO_JCD = {v: k for k, v in JCD_TO_NAME.items()}
 
 
-# ============================================================
-# 場別1コース1着率（直近1年概算・半年ごと手動更新推奨）
-# ============================================================
+def _jcode(jcd: str) -> str:
+    """uchisankaku用: 0埋めなしに変換 ('05'→'5')"""
+    return str(int(jcd))
+
+
 COURSE1_WIN_RATE = {
     "桐生": 0.54, "戸田": 0.44, "江戸川": 0.46, "平和島": 0.48,
     "多摩川": 0.55, "浜名湖": 0.52, "蒲郡": 0.54, "常滑": 0.54,
@@ -56,10 +47,6 @@ COURSE1_WIN_RATE = {
     "芦屋": 0.62, "福岡": 0.54, "唐津": 0.54, "大村": 0.66,
 }
 
-
-# ============================================================
-# HTTP取得
-# ============================================================
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -67,12 +54,11 @@ HEADERS = {
     ),
     "Accept-Language": "ja-JP,ja;q=0.9",
 }
-BASE = "https://www.boatrace.jp/owpc/pc/race"
-TIMEOUT = 10
+UCHI_BASE = "https://uchisankaku.sakura.ne.jp"
+TIMEOUT = 15
 
 
 def _get(url: str, retries: int = 2) -> Optional[str]:
-    """URLをGETしてHTMLを返す。失敗時はNone。"""
     for i in range(retries + 1):
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -86,282 +72,250 @@ def _get(url: str, retries: int = 2) -> Optional[str]:
     return None
 
 
-# ============================================================
-# 開催場判定
-# ============================================================
-def fetch_open_venues(date_str: str) -> List[str]:
-    """
-    指定日に開催している場のjcdリストを返す。
-    全24場を試行して raceindex が取得できた場を開催中とみなす。
-    """
-    open_jcds: List[str] = []
-    def check(jcd):
-        url = f"{BASE}/raceindex?jcd={jcd}&hd={date_str}"
-        html = _get(url, retries=1)
-        if html and "締切予定時刻" in html and "レース一覧" in html:
-            return jcd
-        return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        results = list(ex.map(check, JCD_TO_NAME.keys()))
-    open_jcds = [j for j in results if j]
-    return open_jcds
-
-
-# ============================================================
-# 出走表パーサ
-# ============================================================
-_RE_TOBAN = re.compile(r"(\d{4})\s*/\s*([AB][12])")
-_RE_AGE_WEIGHT = re.compile(r"(\d+)歳\s*/\s*(\d+\.\d+)kg")
-_RE_F_L_ST = re.compile(r"F(\d+)\s+L(\d+)\s+(\d+\.\d+)")
-_RE_THREE_NUM = re.compile(r"(-|\d+(?:\.\d+)?)\s+(-|\d+(?:\.\d+)?)\s+(-|\d+(?:\.\d+)?)")
-
-# 節間成績: STは「.32」のような小数点始まり、「F.02」「L」などもある
-_RE_SETTLE_ST = re.compile(r"^[FL]?\.?(\d{2,3})$")  # .32, F.02, L, 等
-# 着順: 単一数字、または 1〜6（全角漢字もあり）
-_KANJI_NUM = {"１": 1, "２": 2, "３": 3, "４": 4, "５": 5, "６": 6,
-              "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
-
-
-def _parse_settle_row(cells_text: list, anchor_kanji: list = None) -> dict:
-    """
-    選手ブロックの末尾付近にある今節成績（コース・ST・着順の3行）から
-    節間ST平均・節間2連率を抽出する。
-
-    cells_text: tbody内のtdテキストを順番に並べたリスト
-    anchor_kanji: aタグ内に含まれる漢数字テキストのリスト（着順専用）
-    戻り値: {"settle_st": float or None, "settle_2rate": float or None}
-    """
-    # ST値候補（.NN 形式）を抽出
-    st_values = []
-    for t in cells_text:
-        t = t.strip()
-        if t.startswith("F") or t.startswith("L"):
-            continue
-        m = re.fullmatch(r"\.(\d{2,3})", t)
-        if m:
-            try:
-                v = float("0." + m.group(1))
-                if 0.0 <= v <= 0.40:
-                    st_values.append(v)
-            except ValueError:
-                pass
-
-    # 着順候補（aタグ内の漢数字 or 全角数字のみ）
-    finish_positions = []
-    if anchor_kanji:
-        for t in anchor_kanji:
-            t = t.strip()
-            if t in _KANJI_NUM:
-                finish_positions.append(_KANJI_NUM[t])
-
-    settle_st = None
-    if st_values:
-        settle_st = round(sum(st_values) / len(st_values), 3)
-
-    settle_2rate = None
-    if finish_positions:
-        in_2 = sum(1 for p in finish_positions if p <= 2)
-        settle_2rate = round(in_2 / len(finish_positions), 3)
-
-    return {"settle_st": settle_st, "settle_2rate": settle_2rate}
-
-
 def _num(s: str) -> Optional[float]:
+    if s is None:
+        return None
+    s = s.strip().replace("%", "").replace("　", "")
+    if s in ("", "-", "--"):
+        return None
     try:
         return float(s)
-    except (TypeError, ValueError):
+    except ValueError:
         return None
 
 
-def parse_racelist(html: str) -> Optional[List[Racer]]:
-    """
-    出走表HTMLから6艇分のRacerリストを返す。失敗時はNone。
-    """
+def _row_values(tr) -> List[str]:
+    return [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+
+
+# ============================================================
+# 1場分の全12Rパース
+# ============================================================
+def parse_venue_page(html: str, venue: str) -> Dict[int, Race]:
+    """uchisankakuの1場ページHTMLから {rno: Race} を返す"""
     soup = BeautifulSoup(html, "html.parser")
+    result: Dict[int, Race] = {}
 
-    # 出走表テーブルは tbody.is-fs12 が6つ並ぶ（各艇1つ）
-    tbodies = soup.select("tbody.is-fs12")
-    if len(tbodies) < 6:
-        return None
+    tables = soup.find_all("table")
 
-    racers: List[Racer] = []
-    for tbody in tbodies[:6]:
-        text = tbody.get_text(" ", strip=True)
+    for table in tables:
+        # このテーブルの直前にある見出し/テキストから「NR」を抽出
+        rno = None
+        prev = table.find_previous(["h1", "h2", "h3", "h4", "p"])
+        hops = 0
+        while prev is not None and hops < 5:
+            text = prev.get_text(" ", strip=True)
+            m = re.search(r"(\d{1,2})R", text)
+            if m and int(m.group(1)) <= 12:
+                rno = int(m.group(1))
+                break
+            prev = prev.find_previous(["h1", "h2", "h3", "h4", "p"])
+            hops += 1
+        if rno is None:
+            continue
 
-        # 登録番号・級別
-        m_toban = _RE_TOBAN.search(text)
-        if not m_toban:
-            return None
-        toban, cls_ = m_toban.group(1), m_toban.group(2)
+        rows = table.find_all("tr")
+        if len(rows) < 10:
+            continue
 
-        # 選手名（aタグ内）
-        name_tag = tbody.select_one("a")
-        name = ""
-        if name_tag:
-            name = re.sub(r"\s+", "", name_tag.get_text(strip=True))
+        boat_data: List[Dict[str, Any]] = [dict() for _ in range(6)]
+        current_section = ""  # "成績/全国", "今節成績", "コース別", "決り手", "モーター" など
 
-        # 年齢/体重
-        m_age = _RE_AGE_WEIGHT.search(text)
-        weight = _num(m_age.group(2)) if m_age else None
+        for tr in rows:
+            cells = _row_values(tr)
+            if len(cells) < 6:
+                continue
 
-        # F/L/平均ST
-        m_fl = _RE_F_L_ST.search(text)
-        f_count = int(m_fl.group(1)) if m_fl else 0
-        avg_st = _num(m_fl.group(3)) if m_fl else None
+            labels = cells[:-6]
+            values = cells[-6:]
+            label_parts = [c for c in labels if c]
 
-        # 勝率行: 全国と当地の順に2つある
-        #   「3.46  12.28  29.82」のような3数値
-        # F/L行以降から探す
-        remaining = text
-        if m_fl:
-            remaining = text[m_fl.end():]
-        triples = _RE_THREE_NUM.findall(remaining)
+            # ラベル部の最初の要素はセクション名の可能性が高い
+            # rowspanの影響で空セルが飛んだり、単独ラベルになったりするので
+            # 「明示的にセクション名が含まれる」場合だけセクション更新
+            combined = "".join(label_parts).replace("　", "").replace(" ", "")
 
-        # 最初の triple = 全国(勝率, 2連率, 3連率)、次が当地、次がモーター、次がボート
-        win_rate = None
-        motor_2rate = None
-        if len(triples) >= 1:
-            win_rate = _num(triples[0][0])
-        if len(triples) >= 3:
-            # モーター2連率は %表記なので /100
-            m2 = _num(triples[2][1])
-            motor_2rate = m2 / 100.0 if m2 is not None else None
+            # セクション検出（優先順位順）
+            section_keywords = [
+                ("今節成績", "今節成績"),
+                ("コース別", "コース別"),
+                ("決り手", "決り手"),
+                ("モーター", "モーター"),
+                ("成績", "成績"),  # 汎用ラベル、弱め
+            ]
+            for key, sec_name in section_keywords:
+                if key in combined:
+                    current_section = sec_name
+                    break
 
-        # 節間成績抽出: tbody内の全td/aタグをテキスト化して解析
-        cells_text = []
-        for el in tbody.find_all(["td"]):
-            tx = el.get_text(strip=True)
-            if tx:
-                cells_text.append(tx)
-        # aタグ内の漢数字（着順リンク）のみを別途収集
-        anchor_kanji = []
-        for a in tbody.find_all("a"):
-            tx = a.get_text(strip=True)
-            # raceresult?rno=... へのリンクが着順リンク
-            href = a.get("href", "")
-            if "raceresult" in href and tx in _KANJI_NUM:
-                anchor_kanji.append(tx)
-            elif tx in _KANJI_NUM:
-                # href属性がない/他形式でも漢数字単独なら着順扱い
-                anchor_kanji.append(tx)
-        settle = _parse_settle_row(cells_text, anchor_kanji=anchor_kanji)
+            # 「全国」「当地」のサブセクション判別
+            if "全国" in combined and current_section == "成績":
+                current_section = "成績/全国"
+            elif "当地" in combined and current_section.startswith("成績"):
+                current_section = "成績/当地"
 
-        racers.append(Racer(
-            name=name,
-            cls=cls_,
-            win_rate=win_rate,
-            avg_st=avg_st,
-            motor_2rate=motor_2rate,
-            f_count=f_count,
-            weight=weight,
-            settle_st=settle["settle_st"],
-            settle_2rate=settle["settle_2rate"],
-        ))
+            # 最終ラベル = セクション + 末尾のサブラベル
+            # 末尾ラベルは label_parts の最後、または combined から section を引いた残り
+            subkey = combined
+            for key, _ in section_keywords:
+                subkey = subkey.replace(key, "")
+            subkey = subkey.replace("全国", "").replace("当地", "").replace("／直近6カ月", "").replace("／直近６カ月", "")
 
-    return racers if len(racers) == 6 else None
+            full_label = f"{current_section}/{subkey}" if subkey else current_section
+
+            _assign_row(boat_data, full_label, combined, current_section, subkey, values)
+
+        if any(d.get("cls") for d in boat_data) and rno not in result:
+            racers = [_to_racer(boat_data[i]) for i in range(6)]
+            result[rno] = Race(
+                venue=venue, r_no=rno,
+                b1=racers[0], b2=racers[1], b3=racers[2],
+                b4=racers[3], b5=racers[4], b6=racers[5],
+                weather=Weather(),
+                course1_win_rate_venue=COURSE1_WIN_RATE.get(venue, 0.52),
+                v14_hit=False,
+            )
+
+    return result
 
 
-def fetch_race(date_str: str, jcd: str, rno: int) -> Optional[Race]:
-    """指定レースの Race オブジェクトを返す。失敗時 None。"""
-    url = f"{BASE}/racelist?rno={rno}&jcd={jcd}&hd={date_str}"
-    html = _get(url)
-    if not html:
-        return None
-    racers = parse_racelist(html)
-    if not racers:
-        return None
+def _assign_row(boat_data: List[Dict[str, Any]], full_label: str,
+                combined: str, section: str, subkey: str, values: List[str]):
+    """セクション文脈を考慮した属性代入"""
 
-    venue = JCD_TO_NAME[jcd]
-    return Race(
-        venue=venue,
-        r_no=rno,
-        b1=racers[0], b2=racers[1], b3=racers[2],
-        b4=racers[3], b5=racers[4], b6=racers[5],
-        weather=Weather(),  # 直前情報は別取得（未実装）
-        course1_win_rate_venue=COURSE1_WIN_RATE.get(venue, 0.52),
-        v14_hit=False,
+    # 階級
+    if "級別" in combined:
+        for i, v in enumerate(values):
+            if v in ("A1", "A2", "B1", "B2"):
+                boat_data[i]["cls"] = v
+        return
+
+    # 氏名
+    if "氏名" in combined:
+        for i, v in enumerate(values):
+            boat_data[i]["name"] = v.replace("　", "").replace(" ", "")
+        return
+
+    # 体重
+    if "体重" in combined:
+        for i, v in enumerate(values):
+            m = re.search(r"(\d+\.\d+)", v)
+            if m:
+                boat_data[i]["weight"] = float(m.group(1))
+        return
+
+    # F数
+    if "F数" in combined:
+        for i, v in enumerate(values):
+            m = re.search(r"F(\d+)", v)
+            if m:
+                boat_data[i]["f_count"] = int(m.group(1))
+        return
+
+    # 全国勝率 (セクション=成績/全国 かつ ラベル=勝率)
+    if section == "成績/全国" and "勝率" in subkey:
+        for i, v in enumerate(values):
+            n = _num(v)
+            if n is not None:
+                boat_data[i]["win_rate"] = n
+        return
+
+    # 今節成績 ST
+    if section == "今節成績" and "ST" in subkey:
+        for i, v in enumerate(values):
+            n = _num(v)
+            if n is not None:
+                boat_data[i]["settle_st"] = n
+        return
+
+    # 今節成績 2連率
+    if section == "今節成績" and "2連率" in subkey:
+        for i, v in enumerate(values):
+            n = _num(v)
+            if n is not None:
+                boat_data[i]["settle_2rate"] = n / 100.0
+        return
+
+    # コース別 ST（追い風/向い風 除外）
+    if section == "コース別" and subkey == "ST":
+        for i, v in enumerate(values):
+            n = _num(v)
+            if n is not None:
+                boat_data[i]["avg_st"] = n
+        return
+
+    # モーター 2連率
+    if section == "モーター" and "2連率" in subkey:
+        for i, v in enumerate(values):
+            n = _num(v)
+            if n is not None:
+                boat_data[i]["motor_2rate"] = n / 100.0
+        return
+
+    # 決り手 捲り (捲り差し, 捲られ は除く)
+    if section == "決り手" and subkey == "捲り":
+        for i, v in enumerate(values):
+            v_clean = v.replace("(", "").replace(")", "")
+            n = _num(v_clean)
+            if n is not None:
+                boat_data[i]["makuri_pct"] = n
+        return
+
+
+def _to_racer(d: Dict[str, Any]) -> Racer:
+    makuri_pct = d.get("makuri_pct")
+    return Racer(
+        name=d.get("name", ""),
+        cls=d.get("cls", ""),
+        win_rate=d.get("win_rate"),
+        avg_st=d.get("avg_st"),
+        settle_st=d.get("settle_st"),
+        settle_2rate=d.get("settle_2rate"),
+        motor_2rate=d.get("motor_2rate"),
+        f_count=d.get("f_count", 0),
+        weight=d.get("weight"),
+        course5_avg_st=d.get("avg_st"),
+        makuri_rate=(makuri_pct / 100.0) if makuri_pct is not None else None,
     )
 
 
 # ============================================================
-# 直前情報（任意・展示タイム/天候を補強）
+# 取得関数
 # ============================================================
-def fetch_beforeinfo(date_str: str, jcd: str, rno: int) -> Dict[str, Any]:
-    """
-    直前情報から天候・波・風・展示順位を取得する。
-    失敗時は空dict。取得できた項目だけ埋める。
-    """
-    url = f"{BASE}/beforeinfo?rno={rno}&jcd={jcd}&hd={date_str}"
-    html = _get(url, retries=1)
+def fetch_venue_races(date_str: str, jcd: str) -> Dict[int, Race]:
+    venue = JCD_TO_NAME[jcd]
+    url = f"{UCHI_BASE}/racelist.php?jcode={_jcode(jcd)}&date={date_str}"
+    html = _get(url)
     if not html:
         return {}
-    soup = BeautifulSoup(html, "html.parser")
-    info: Dict[str, Any] = {}
+    return parse_venue_page(html, venue)
 
-    # 天候・風・波 (テキストから抽出)
-    text = soup.get_text(" ", strip=True)
-    m_wind = re.search(r"風速\s*(\d+)\s*m", text)
-    if m_wind:
-        info["wind_mps"] = float(m_wind.group(1))
-    m_wave = re.search(r"波\s*(?:高)?\s*(\d+)\s*cm", text)
-    if m_wave:
-        info["wave_cm"] = float(m_wave.group(1))
 
-    # 風向判定は画像クラスだが、テキストから簡易判定
-    if "追風" in text or "追い風" in text:
-        info["wind_dir"] = "tail"
-    elif "向風" in text or "向い風" in text:
-        info["wind_dir"] = "head"
-    elif "横風" in text:
-        info["wind_dir"] = "side"
-
-    # 安定板
-    if "安定板" in text and "使用" in text:
-        info["stabilizer"] = True
-
-    # 展示タイム → 各艇のタイムを抽出して順位付け
-    try:
-        # 「展示タイム」ラベル付近のテーブルを探す
-        times = []
-        for td in soup.select("td"):
-            tx = td.get_text(strip=True)
-            if re.fullmatch(r"\d+\.\d{2}", tx):
-                times.append(float(tx))
-        if len(times) >= 6:
-            top6 = times[:6]
-            # 小さい順位1位
-            order = sorted(range(6), key=lambda i: top6[i])
-            ranks = [0] * 6
-            for rank, idx in enumerate(order, start=1):
-                ranks[idx] = rank
-            info["exhibit_ranks"] = ranks  # インデックス0=1号艇
-    except Exception:
-        pass
-
-    return info
+def fetch_race(date_str: str, jcd: str, rno: int) -> Optional[Race]:
+    races = fetch_venue_races(date_str, jcd)
+    return races.get(rno)
 
 
 def enrich_with_beforeinfo(race: Race, date_str: str, jcd: str) -> Race:
-    """直前情報を取りに行って Race を更新する。失敗時は無変更。"""
-    info = fetch_beforeinfo(date_str, jcd, race.r_no)
-    if not info:
-        return race
-    w = race.weather
-    if "wind_mps" in info:
-        w.wind_mps = info["wind_mps"]
-    if "wave_cm" in info:
-        w.wave_cm = info["wave_cm"]
-    if "wind_dir" in info:
-        w.wind_dir = info["wind_dir"]
-    if "stabilizer" in info:
-        w.stabilizer = info["stabilizer"]
-    # 展示順位
-    if "exhibit_ranks" in info:
-        boats = [race.b1, race.b2, race.b3, race.b4, race.b5, race.b6]
-        for i, r in enumerate(boats):
-            r.exhibit_rank = info["exhibit_ranks"][i]
+    """互換API維持のためスタブ"""
     return race
+
+
+# ============================================================
+# 開催場判定
+# ============================================================
+def fetch_open_venues(date_str: str) -> List[str]:
+    """24場を並列で軽く叩いて開催中の場を検出"""
+    def check(jcd):
+        url = f"{UCHI_BASE}/racelist.php?jcode={_jcode(jcd)}&date={date_str}"
+        html = _get(url, retries=1)
+        if html and ("今節成績" in html or "級別" in html):
+            return jcd
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(check, JCD_TO_NAME.keys()))
+    return [j for j in results if j]
 
 
 # ============================================================
@@ -374,75 +328,55 @@ def fetch_day_candidates(
     progress_cb=None,
 ) -> List[Dict[str, Any]]:
     """
-    指定日の全開催場・全12Rを走査し、
+    uchisankakuから1場1リクエストで取得し、
     TOTAL >= min_total の候補レースを返す。
-
-    Args:
-        date_str: "YYYYMMDD"
-        min_total: 最低TOTALスコア（デフォ9.0＝△押さえ以上）
-        use_beforeinfo: Trueなら直前情報も取得（遅くなる）
-        progress_cb: callable(done, total, label) 進捗コールバック
-
-    Returns:
-        [{"venue", "r_no", "jcd", "date", "race", "scores", "judge",
-          "bets", "reject_reasons"}, ...]
     """
-    # 開催場検出
     if progress_cb:
-        progress_cb(0, 1, "開催場を取得中...")
+        progress_cb(0, 1, "開催場を検索中...")
     open_jcds = fetch_open_venues(date_str)
     if not open_jcds:
         return []
 
-    targets: List[Tuple[str, int]] = [
-        (jcd, rno) for jcd in open_jcds for rno in range(1, 13)
-    ]
-    total_count = len(targets)
-
+    total_venues = len(open_jcds)
     results: List[Dict[str, Any]] = []
-    done = 0
+    done_count = [0]
 
-    def work(item):
-        jcd, rno = item
-        race = fetch_race(date_str, jcd, rno)
-        if race is None:
-            return None
-        if use_beforeinfo:
-            race = enrich_with_beforeinfo(race, date_str, jcd)
-        ok, reasons = is_165_candidate(race)
-        if not ok:
-            return None  # ハード条件NGはドロップ（結果に含めない）
-        s = score_165(race)
-        if s["TOTAL"] < min_total:
-            return None  # スコア不足もドロップ
-        return {
-            "venue": race.venue, "r_no": rno, "jcd": jcd, "date": date_str,
-            "race": race, "scores": s, "judge": judge_rank(s["TOTAL"]),
-            "bets": generate_bets(s["TOTAL"]), "reject_reasons": [],
-            "candidate": True,
-        }
+    def work(jcd):
+        races = fetch_venue_races(date_str, jcd)
+        out = []
+        for rno, race in races.items():
+            ok, _ = is_165_candidate(race)
+            if not ok:
+                continue
+            s = score_165(race)
+            if s["TOTAL"] < min_total:
+                continue
+            out.append({
+                "venue": race.venue, "r_no": rno, "jcd": jcd, "date": date_str,
+                "race": race, "scores": s, "judge": judge_rank(s["TOTAL"]),
+                "bets": generate_bets(s["TOTAL"]), "reject_reasons": [],
+                "candidate": True,
+            })
+        return jcd, out
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {ex.submit(work, t): t for t in targets}
+        futures = {ex.submit(work, j): j for j in open_jcds}
         for fut in concurrent.futures.as_completed(futures):
-            done += 1
+            done_count[0] += 1
+            jcd = futures[fut]
             if progress_cb:
-                jcd, rno = futures[fut]
-                progress_cb(done, total_count, f"{JCD_TO_NAME[jcd]} {rno}R")
-            r = fut.result()
-            if r is not None:
-                results.append(r)
+                progress_cb(done_count[0], total_venues, f"{JCD_TO_NAME[jcd]}")
+            try:
+                _, venue_results = fut.result()
+                results.extend(venue_results)
+            except Exception:
+                pass
 
-    # TOTAL降順
     results.sort(key=lambda x: (x["scores"]["TOTAL"] if x["scores"] else -999), reverse=True)
     return results
 
 
-# ============================================================
-# 日付変換
-# ============================================================
 def date_to_str(d) -> str:
-    """datetime.date / datetime / 'YYYY-MM-DD' / 'YYYYMMDD' を 'YYYYMMDD' に統一"""
     if isinstance(d, str):
         return d.replace("-", "").replace("/", "")
     if hasattr(d, "strftime"):
@@ -450,9 +384,6 @@ def date_to_str(d) -> str:
     raise ValueError(f"Invalid date: {d}")
 
 
-# ============================================================
-# CLI動作確認
-# ============================================================
 if __name__ == "__main__":
     import sys
     date_arg = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y%m%d")
