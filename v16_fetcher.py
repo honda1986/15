@@ -55,6 +55,7 @@ HEADERS = {
     "Accept-Language": "ja-JP,ja;q=0.9",
 }
 UCHI_BASE = "https://uchisankaku.sakura.ne.jp"
+OFFICIAL_BASE = "https://www.boatrace.jp/owpc/pc/race"
 TIMEOUT = 15
 
 
@@ -382,6 +383,225 @@ def date_to_str(d) -> str:
     if hasattr(d, "strftime"):
         return d.strftime("%Y%m%d")
     raise ValueError(f"Invalid date: {d}")
+
+
+# ============================================================
+# レース結果取得 & 回収率計算
+# ============================================================
+def fetch_race_result(date_str: str, jcd: str, rno: int) -> Optional[Dict[str, Any]]:
+    """
+    boatrace.jp公式から結果と払戻金を取得。
+    レース未終了（結果未発表）の場合は None。
+
+    Returns:
+        {
+            "finish_order": [1, 3, 6, 5, 4, 2],   # 着順（1着から6着の艇番）
+            "trifecta_combo": "1-3-6",             # 3連単
+            "trifecta_payout": 7040,
+            "exacta_combo": "1-3",                 # 2連単
+            "exacta_payout": 790,
+            "kimarite": "逃げ",
+            "is_165_hit": False,  # 1着1号艇かつ 5号艇が2-3着
+        }
+    """
+    url = f"{OFFICIAL_BASE}/raceresult?rno={rno}&jcd={jcd}&hd={date_str}"
+    html = _get(url, retries=1)
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n", strip=True)
+
+    # 着順抽出: 「１ | 1 | 3353 前田 光昭 | 1'50"4」形式
+    # 漢数字の着位→枠番 を取得
+    finish_order: List[int] = []
+    kanji_to_num = {"１": 1, "２": 2, "３": 3, "４": 4, "５": 5, "６": 6,
+                    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6}
+
+    # 結果テーブル: 着, 枠, ボートレーサー, レースタイム の4列
+    for tr in soup.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        if len(cells) >= 3:
+            first = cells[0]
+            second = cells[1]
+            # 1列目が漢数字(着)、2列目が半角数字(枠)
+            if first in kanji_to_num and re.fullmatch(r"[1-6]", second):
+                finish_order.append(int(second))
+
+    if len(finish_order) < 3:
+        return None  # 結果未発表
+
+    # 払戻金抽出
+    trifecta_combo = None
+    trifecta_payout = None
+    exacta_combo = None
+    exacta_payout = None
+
+    for tr in soup.find_all("tr"):
+        cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+        if len(cells) >= 3:
+            if cells[0] == "3連単":
+                trifecta_combo = cells[1]
+                trifecta_payout = _parse_payout(cells[2])
+            elif cells[0] == "2連単":
+                exacta_combo = cells[1]
+                exacta_payout = _parse_payout(cells[2])
+
+    # 決まり手抽出
+    kimarite = ""
+    m_kim = re.search(r"決まり手\s*(\S+)", text)
+    if m_kim:
+        candidate = m_kim.group(1)
+        if candidate in ("逃げ", "差し", "まくり", "まくり差し", "抜き", "恵まれ"):
+            kimarite = candidate
+
+    return {
+        "finish_order": finish_order,
+        "trifecta_combo": trifecta_combo,
+        "trifecta_payout": trifecta_payout,
+        "exacta_combo": exacta_combo,
+        "exacta_payout": exacta_payout,
+        "kimarite": kimarite,
+        "is_165_hit": _is_165_hit(finish_order),
+    }
+
+
+def _parse_payout(s: str) -> Optional[int]:
+    """「¥7,040」→ 7040"""
+    if not s:
+        return None
+    m = re.search(r"([\d,]+)", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _is_165_hit(finish_order: List[int]) -> bool:
+    """1着1号艇 & 5号艇が2-3着"""
+    if len(finish_order) < 3:
+        return False
+    return finish_order[0] == 1 and 5 in finish_order[1:3]
+
+
+def calculate_recovery(bets: Dict[str, List[str]],
+                       result: Dict[str, Any],
+                       bet_amount: int = 100) -> Dict[str, Any]:
+    """
+    買い目と結果から回収率を計算。各点100円×投資で計算。
+
+    Returns:
+        {
+            "total_spent": 1100,
+            "total_return": 790,
+            "recovery_rate": 71.8,
+            "hits": [("1-3", 790)],  # 的中した買い目と払戻金
+            "is_profitable": False,
+        }
+    """
+    total_spent = 0
+    total_return = 0
+    hits: List[Tuple[str, int]] = []
+
+    trifecta_combo = result.get("trifecta_combo")
+    trifecta_payout = result.get("trifecta_payout") or 0
+    exacta_combo = result.get("exacta_combo")
+    exacta_payout = result.get("exacta_payout") or 0
+
+    # 3連単（本線＋押さえ）
+    for category in ("3連単_本線", "3連単_押さえ"):
+        for bet in bets.get(category, []):
+            total_spent += bet_amount
+            if bet == trifecta_combo:
+                win = trifecta_payout * (bet_amount / 100)
+                total_return += int(win)
+                hits.append((bet, int(win)))
+
+    # 2連単
+    for bet in bets.get("2連単", []):
+        total_spent += bet_amount
+        if bet == exacta_combo:
+            win = exacta_payout * (bet_amount / 100)
+            total_return += int(win)
+            hits.append((bet, int(win)))
+
+    recovery_rate = (total_return / total_spent * 100) if total_spent > 0 else 0.0
+    return {
+        "total_spent": total_spent,
+        "total_return": total_return,
+        "recovery_rate": round(recovery_rate, 1),
+        "hits": hits,
+        "is_profitable": total_return >= total_spent,
+    }
+
+
+def enrich_candidates_with_results(candidates: List[Dict[str, Any]],
+                                    progress_cb=None) -> List[Dict[str, Any]]:
+    """
+    候補リスト各レースについて結果を取得して enrich。
+    未終了レースは result=None のまま残す。
+    """
+    total = len(candidates)
+    done = [0]
+
+    def work(cand):
+        try:
+            result = fetch_race_result(cand["date"], cand["jcd"], cand["r_no"])
+        except Exception:
+            result = None
+        if result is not None:
+            cand["result"] = result
+            if cand.get("bets"):
+                cand["recovery"] = calculate_recovery(cand["bets"], result)
+        else:
+            cand["result"] = None
+            cand["recovery"] = None
+        return cand
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(work, c): c for c in candidates}
+        enriched = []
+        for fut in concurrent.futures.as_completed(futures):
+            done[0] += 1
+            if progress_cb:
+                progress_cb(done[0], total, "結果取得中")
+            try:
+                enriched.append(fut.result())
+            except Exception:
+                enriched.append(futures[fut])
+
+    # 元の順序(TOTAL降順)を維持
+    enriched.sort(key=lambda x: (x["scores"]["TOTAL"] if x.get("scores") else -999), reverse=True)
+    return enriched
+
+
+def aggregate_recovery(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    終了済みレース全体の集計。
+    """
+    finished = [c for c in candidates if c.get("result") is not None]
+    if not finished:
+        return {"n_finished": 0, "n_total": len(candidates)}
+
+    total_spent = sum(c["recovery"]["total_spent"] for c in finished if c.get("recovery"))
+    total_return = sum(c["recovery"]["total_return"] for c in finished if c.get("recovery"))
+    n_165_hit = sum(1 for c in finished if c["result"]["is_165_hit"])
+    n_any_hit = sum(1 for c in finished if c.get("recovery") and c["recovery"]["total_return"] > 0)
+
+    return {
+        "n_total": len(candidates),
+        "n_finished": len(finished),
+        "n_pending": len(candidates) - len(finished),
+        "n_165_hit": n_165_hit,
+        "n_any_hit": n_any_hit,
+        "hit_165_rate": round(n_165_hit / len(finished) * 100, 1) if finished else 0,
+        "hit_any_rate": round(n_any_hit / len(finished) * 100, 1) if finished else 0,
+        "total_spent": total_spent,
+        "total_return": total_return,
+        "recovery_rate": round(total_return / total_spent * 100, 1) if total_spent > 0 else 0,
+    }
 
 
 if __name__ == "__main__":
