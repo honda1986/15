@@ -270,24 +270,19 @@ with tab1:
             agg = aggregate_recovery(cands)
             if agg.get("n_finished", 0) > 0:
                 st.markdown("### 📊 全体成績")
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3 = st.columns(3)
                 c1.metric(
                     "終了レース",
                     f"{agg['n_finished']}/{agg['n_total']}",
                     f"未終了 {agg['n_pending']}" if agg.get('n_pending') else None,
                 )
                 c2.metric(
-                    "1=5形的中",
-                    f"{agg['n_165_hit']}/{agg['n_finished']}",
-                    f"{agg['hit_165_rate']}%",
-                )
-                c3.metric(
-                    "何らか的中",
+                    "買い目的中",
                     f"{agg['n_any_hit']}/{agg['n_finished']}",
                     f"{agg['hit_any_rate']}%",
                 )
                 rr = agg['recovery_rate']
-                c4.metric(
+                c3.metric(
                     "回収率",
                     f"{rr}%",
                     f"{'+' if rr >= 100 else ''}{int(agg['total_return'] - agg['total_spent']):+,}円",
@@ -302,14 +297,18 @@ with tab1:
                 result = c.get("result")
                 recovery = c.get("recovery")
 
-                # 結果表示
+                # 結果表示（買い目的中ベース）
                 if result:
                     finish = "-".join(str(n) for n in result["finish_order"][:3])
-                    hit_165 = "✅" if result["is_165_hit"] else "✕"
+                    # 買い目的中の有無で判定
+                    if recovery and recovery.get("hits"):
+                        hit_mark = "✅"
+                    else:
+                        hit_mark = "✕"
                     rr_pct = f"{recovery['recovery_rate']}%" if recovery else "-"
                 else:
                     finish = "未終了"
-                    hit_165 = "-"
+                    hit_mark = "-"
                     rr_pct = "-"
 
                 rows.append({
@@ -319,7 +318,7 @@ with tab1:
                     "判定": c["judge"],
                     "TOTAL": f"{s['TOTAL']:+.2f}",
                     "結果": finish,
-                    "1=5": hit_165,
+                    "的中": hit_mark,
                     "回収率": rr_pct,
                     "P1": f"{s['P1']:+.1f}",
                     "P5": f"{s['P5']:+.1f}",
