@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-v16 1=5形フィルタ Streamlit UI (日付指定スクレイピング版)
+v16 1=5形フィルタ Streamlit UI (期間指定スクレイピング版)
 =======================================================
-boatrace.jp から出走表を取得し、指定日の全開催場・全レースを走査して
+boatrace.jp から出走表を取得し、指定期間の全開催場・全レースを走査して
 v16 1=5形の候補レースを抽出する。
 
 必要ファイル (同じディレクトリに置くこと):
@@ -37,7 +37,9 @@ st.caption("1着=1号艇 / 2-3着=5号艇 を狙い撃つ")
 # ======================================================
 def render_detail(sel: dict):
     race = sel["race"]
-    st.markdown(f"### {sel['venue']} {sel['r_no']}R")
+    # 日付があれば日付もタイトルに表示
+    date_label = f"[{sel['date']}] " if "date" in sel else ""
+    st.markdown(f"### {date_label}{sel['venue']} {sel['r_no']}R")
 
     if not sel["candidate"]:
         st.error("❌ 対象外: " + " / ".join(sel["reject_reasons"]))
@@ -138,12 +140,14 @@ def render_detail(sel: dict):
                     st.markdown(f"- `{combo}` → ¥{payout:,}")
             else:
                 st.info("買い目不的中")
-    elif sel.get("date"):  # 対象日が指定されている = レース情報がある
+    elif sel.get("date"):
         st.info("🕓 このレースはまだ結果が出ていません")
 
     jcd = sel.get("jcd") or NAME_TO_JCD.get(sel["venue"], "")
-    date_str = sel.get("date") or st.session_state.get("target_date_str", "")
-    if jcd and date_str:
+    # 公式ページ遷移時のURL用（範囲文字列が入らないように sel['date'] を優先）
+    date_str = sel.get("date") or (st.session_state.get("target_date_str", "").split(" ")[0])
+    
+    if jcd and date_str and len(date_str) == 8:
         st.markdown("**🔗 公式ページ**")
         base = "https://www.boatrace.jp/owpc/pc/race"
         st.markdown(
@@ -156,19 +160,20 @@ def render_detail(sel: dict):
 # ======================================================
 # タブ
 # ======================================================
-tab1, tab2 = st.tabs(["📅 日付指定で一括抽出", "🔧 手動入力"])
+tab1, tab2 = st.tabs(["📅 期間指定で一括抽出", "🔧 手動入力"])
 
 # ------------------------------------------------------
-# タブ1: 日付指定で一括抽出
+# タブ1: 期間指定で一括抽出
 # ------------------------------------------------------
 with tab1:
-    st.subheader("指定日の全開催場・全Rを走査")
+    st.subheader("指定期間の全開催場・全Rを走査")
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        target_date = st.date_input(
-            "対象日",
-            value=datetime.now().date(),
+        # valueにタプルを渡すことで範囲選択を可能にする
+        date_range = st.date_input(
+            "対象期間 (開始日と終了日を選択)",
+            value=(datetime.now().date(), datetime.now().date()),
             min_value=datetime(2020, 1, 1).date(),
             max_value=datetime.now().date() + timedelta(days=1),
         )
@@ -195,44 +200,75 @@ with tab1:
     )
 
     if st.button("🎯 取得して抽出", use_container_width=True, type="primary"):
-        date_str = date_to_str(target_date)
-        prog = st.progress(0.0, text="開催場を検索中...")
+        # 範囲選択の処理 (1日だけ選択された場合は要素が1つのタプルになる)
+        if isinstance(date_range, tuple) or isinstance(date_range, list):
+            start_date = date_range[0]
+            end_date = date_range[1] if len(date_range) > 1 else start_date
+        else:
+            start_date = end_date = date_range
 
-        def pb(done, total, label):
-            prog.progress(done / max(total, 1), text=f"[{done}/{total}] {label}")
+        # 対象日付のリストを作成
+        date_list = []
+        curr = start_date
+        while curr <= end_date:
+            date_list.append(curr)
+            curr += timedelta(days=1)
 
-        with st.spinner("データ取得中..."):
-            cands = fetch_day_candidates(
-                date_str,
-                min_total=min_total,
-                use_beforeinfo=use_beforeinfo,
-                progress_cb=pb,
-            )
-            # 結果取得（終了済みレースのみ）
-            if fetch_results and cands:
-                cands = enrich_candidates_with_results(cands, progress_cb=pb)
+        prog = st.progress(0.0, text="処理を開始します...")
+        all_cands = []
+
+        with st.spinner(f"データ取得中... (全{len(date_list)}日)"):
+            for i, target_d in enumerate(date_list):
+                date_str = date_to_str(target_d)
+
+                def pb(done, total, label):
+                    # 複数日の進捗を分かりやすく表示
+                    overall_text = f"[{i+1}/{len(date_list)}日目: {date_str}] {label}"
+                    prog.progress(done / max(total, 1), text=overall_text)
+
+                day_cands = fetch_day_candidates(
+                    date_str,
+                    min_total=min_total,
+                    use_beforeinfo=use_beforeinfo,
+                    progress_cb=pb,
+                )
+                
+                # 結果取得（終了済みレースのみ）
+                if fetch_results and day_cands:
+                    day_cands = enrich_candidates_with_results(day_cands, progress_cb=pb)
+                
+                # 個別のレースに日付情報を付与
+                for c in day_cands:
+                    c["date"] = date_str
+                    
+                all_cands.extend(day_cands)
+
         prog.empty()
-
-        st.session_state["candidates"] = cands
-        st.session_state["target_date_str"] = date_str
+        st.session_state["candidates"] = all_cands
+        
+        # セッションに保存する日付文字列（表示用）
+        if start_date != end_date:
+            st.session_state["target_date_str"] = f"{date_to_str(start_date)} ~ {date_to_str(end_date)}"
+        else:
+            st.session_state["target_date_str"] = date_to_str(start_date)
 
     # 結果表示
     if "candidates" in st.session_state:
         cands = st.session_state["candidates"]
-        date_str = st.session_state.get("target_date_str", "")
+        display_date_str = st.session_state.get("target_date_str", "")
 
         if not cands:
             st.warning(
-                f"{date_str} の候補レースは0件でした。\n\n"
+                f"{display_date_str} の候補レースは0件でした。\n\n"
                 "考えられる理由:\n"
-                "- 指定日に開催がない\n"
+                "- 指定期間に開催がない\n"
                 "- 抽出条件を満たすレースがない\n"
                 "- boatrace.jp への接続失敗（時間をおいて再試行）"
             )
         else:
             # 念のため scores が None のものを除外（防御）
             cands = [c for c in cands if c.get("scores") is not None]
-            st.success(f"✅ {len(cands)}件の候補を抽出しました")
+            st.success(f"✅ {len(cands)}件の候補を抽出しました ({display_date_str})")
 
             # 全体集計（終了済みレースがある場合のみ）
             agg = aggregate_recovery(cands)
@@ -281,6 +317,7 @@ with tab1:
                     rr_pct = "-"
 
                 rows.append({
+                    "日付": c.get("date", ""), # ★テーブルに日付列を追加
                     "場": c["venue"],
                     "R": c["r_no"],
                     "判定": c["judge"],
@@ -298,7 +335,8 @@ with tab1:
 
             st.markdown("---")
             st.subheader("🔍 詳細を見る")
-            options = [f"{c['venue']} {c['r_no']}R  {c['judge']} "
+            # ドロップダウンにも日付を追加して識別しやすく
+            options = [f"{c.get('date', '')} {c['venue']} {c['r_no']}R  {c['judge']} "
                        f"{c['scores']['TOTAL']:+.1f}" for c in cands]
             idx = st.selectbox(
                 "レースを選択",
